@@ -48,8 +48,8 @@ When using our code for evaluation / fine-tuning, we import the datasets from hu
 
 ```python
 import datasets
-datasets.load_dataset('K-and-K/knights-and-knaves')
-datasets.load_dataset('K-and-K/perturbed-knights-and-knaves')
+datasets.load_dataset('K-and-K/knights-and-knaves', 'test')
+datasets.load_dataset('K-and-K/perturbed-knights-and-knaves', 'test')
 ```
 
 ### Option 2: generate data locally
