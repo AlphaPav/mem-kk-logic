@@ -1,5 +1,5 @@
 model="openai/gpt-4o-mini-2024-07-18"
-
+# model="YOUT-DIRECT-FTED-MODEL-PATH"
 
 config="vllm"
 num_limit=100
