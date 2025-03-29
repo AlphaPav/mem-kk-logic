@@ -10,7 +10,13 @@ from datasets import load_dataset
 import random
 import numpy as np
 from functools import partial
+from accelerate import Accelerator
 
+accelerator = Accelerator()
+
+import warnings
+
+warnings.filterwarnings("ignore", message="Trainer.tokenizer is now deprecated")
 
 def init_seed(seed=42):
     random.seed(seed)
@@ -30,26 +36,26 @@ class CustomSFTTrainer(SFTTrainer):
         self.current_epoch = 0
         self.steps_per_epoch = None
         self.accumulated_steps = 0
+        answer_token_ids = self.tokenizer.encode(
+            self.response_template, add_special_tokens=False
+        )
+        self.answer_token_ids = answer_token_ids[1:]
+        self.pad_token_id = self.tokenizer.pad_token_id
 
     def train(self, resume_from_checkpoint=None, **kwargs):
         self.current_epoch = 0  # Reset epoch counter
         self.accumulated_steps = 0  # Reset accumulated steps
         return super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Find the index of "### Answer" in the input_ids
-        answer_token_ids = self.tokenizer.encode(
-            self.response_template, add_special_tokens=False
-        )
-        answer_token_ids = answer_token_ids[1:]
-
         answer_start_indices = []
 
         for batch_idx, input_ids in enumerate(inputs["input_ids"]):
-            for i in range(len(input_ids) - len(answer_token_ids) + 1):
+            for i in range(len(input_ids) - len(self.answer_token_ids) + 1):
                 if (
-                    input_ids[i: i + len(answer_token_ids)].tolist()
-                    == answer_token_ids
+                    input_ids[i: i + len(self.answer_token_ids)].tolist()
+                    == self.answer_token_ids
                 ):
                     answer_start_indices.append((batch_idx, i))
                     break
@@ -92,13 +98,13 @@ class CustomSFTTrainer(SFTTrainer):
             )
 
         for k in before_inputs:
-            pad_value = 0 if k == "attention_mask" else self.tokenizer.pad_token_id
+            pad_value = 0 if k == "attention_mask" else self.pad_token_id
             before_inputs[k] = pad_and_cut(
                 before_inputs[k], max_before_len, pad_value
             ).to(model.device)
 
         for k in after_inputs:
-            pad_value = 0 if k == "attention_mask" else self.tokenizer.pad_token_id
+            pad_value = 0 if k == "attention_mask" else self.pad_token_id
             after_inputs[k] = pad_and_cut(after_inputs[k], max_after_len, pad_value).to(
                 model.device
             )
@@ -141,13 +147,14 @@ class CustomSFTTrainer(SFTTrainer):
         avg_before_loss = sum(self.before_answer_losses) / len(
             self.before_answer_losses
         )
-        wandb.log(
-            {
-                "epoch_loss/avg_after_answer": avg_after_loss,
-                "epoch_loss/avg_before_answer": avg_before_loss,
-            },
-            step=self.current_epoch * self.steps_per_epoch,
-        )
+        if accelerator.is_main_process:
+            wandb.log(
+                {
+                    "epoch_loss/avg_after_answer": avg_after_loss,
+                    "epoch_loss/avg_before_answer": avg_before_loss,
+                },
+                step=self.current_epoch * self.steps_per_epoch,
+            )
 
         print("epoch_loss/avg_after_answer", avg_after_loss)
 
@@ -236,6 +243,7 @@ def parse_args():
         "--run_name", type=str, default="kk_ft_sol_format", help="Wandb run name."
     )
     parser.add_argument("--cot_ft", action="store_true")
+    parser.add_argument("--full_model_ft", action="store_true")
     parser.add_argument("--add_eos", action="store_true")
 
     return parser.parse_args()
@@ -243,64 +251,62 @@ def parse_args():
 
 # Formatting function
 def formatting_prompts_func(example, eos_token):
-    output_texts = []
 
     from dataset.prompt import system_instruction_no_reason
 
-    for i in range(len(example["quiz"])):
-        text = (
-            system_instruction_no_reason
-            + f"\n\n### Question: {example['quiz'][i]}\n### Answer:\nCONCLUSION:\n{example['solution_text_format'][i]}"
-        )
-        text += eos_token
-        output_texts.append(text)
-        if i == 0:
-            print(text)
+  
+    text = (
+        system_instruction_no_reason
+        + f"\n\n### Question: {example['quiz']}\n### Answer:\nCONCLUSION:\n{example['solution_text_format']}"
+    )
+    text += eos_token
+    
 
-    return output_texts
+    return text
 
 
 def formatting_prompts_func_cot(example, eos_token):
-    output_texts = []
+    
     from dataset.prompt import system_instruction
 
     cot_head = "Let's think step by step, by considering whether each person is lying and if that leads to contradiction."
-    for i in range(len(example["quiz"])):
-        cot_steps = example["cot_repeat_steps"][i]
-        cot_steps = " ".join(cot_steps)
-        cot_foot = example["cot_foot"][i]
-        text = (
-            system_instruction
-            + f"\n\n### Question: {example['quiz'][i]}\n### Answer: {cot_head} {cot_steps} {cot_foot}\nCONCLUSION:\n{example['solution_text_format'][i]}"
-        )
-        text += eos_token
 
-        if i == 0:
-            print(text)
-        output_texts.append(text)
-    return output_texts
+    cot_steps = example["cot_repeat_steps"] 
+    cot_steps = " ".join(cot_steps)
+    cot_foot = example["cot_foot"] 
+    text = (
+        system_instruction
+        + f"\n\n### Question: {example['quiz']}\n### Answer: {cot_head} {cot_steps} {cot_foot}\nCONCLUSION:\n{example['solution_text_format']}"
+    )
+    text += eos_token
+
+
+    return text
 
 
 def main():
     init_seed()
     args = parse_args()
-    peft_config = LoraConfig(
-        r=32,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-            "lm_head",
-        ],
-    )
+    if args.full_model_ft:
+        peft_config = None
+    else:
+        peft_config = LoraConfig(
+            r=32,
+            lora_alpha=32,
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+                "lm_head",
+            ],
+        )
 
     # Response template and data collator
     if args.cot_ft:
@@ -314,10 +320,11 @@ def main():
 
     # Initialize wandb
 
-    _ = os.system("wandb login {}".format(args.wandb_key))
-    os.environ["WANDB_API_KEY"] = args.wandb_key
-    wandb.init(project=args.project_name, name=args.run_name)
-    wandb.config.update(args)
+    # _ = os.system("wandb login {}".format(args.wandb_key))
+    # os.environ["WANDB_API_KEY"] = args.wandb_key
+    if accelerator.is_main_process:
+        wandb.init(project=args.project_name, name=args.run_name)
+        wandb.config.update(args)
 
     # Load dataset
     kk_dataset = load_dataset('K-and-K/knights-and-knaves', data_files={
@@ -325,11 +332,16 @@ def main():
         "test": [args.test_data],
     },)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_checkpoint,
-        load_in_4bit=True,
-        device_map="auto",
-    )
+    if args.full_model_ft:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_checkpoint,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_checkpoint,
+            load_in_4bit=True,
+            device_map="auto",
+        )
     tokenizer = AutoTokenizer.from_pretrained(args.model_checkpoint)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -373,7 +385,8 @@ def main():
     trainer.train()
     trainer.save_model(os.path.join(args.output_dir, "final_model"))
     # Close wandb run
-    wandb.finish()
+    if accelerator.is_main_process:
+        wandb.finish()
 
 
 if __name__ == "__main__":
